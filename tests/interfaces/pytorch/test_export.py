@@ -1,94 +1,94 @@
-import torch
-import torch.nn as nn
+import sys
+import pytest
+import copy
 import numpy as np
+import modeci_mdf.execution_engine
 
-torch.use_deterministic_algorithms(True)
-torch.backends.cudnn.deterministic = True
-
-from modeci_mdf.utils import load_mdf_json
-from modeci_mdf.interfaces.pytorch import pytorch_to_mdf
-from modeci_mdf.execution_engine import EvaluableGraph
-
-from modeci_mdf.utils import load_mdf_json
-import json
-
-
-def _check_model(mdf_model):
-    """A helper function to JIT compile a function or torch.nn.Module into Torchscript and convert to MDF and check it"""
-
-    # Generate JSON
-    mdf_model.to_json_file("test.json")
-
-    # Load the JSON
-    load_mdf_json("test.json")
-
-
-def test_simple_module():
-    """Test a simple torch.nn.Module"""
-
-    class Simple(torch.nn.Module):
-        def forward(self, x, y):
-            return x + y
-
-    mdf_model, param_dict = pytorch_to_mdf(
-        model=Simple(),
-        args=(torch.tensor(0.0), torch.tensor(0.0)),
-        example_outputs=(torch.tensor(0.0)),
-        use_onnx_ops=True,
+try:
+    import modeci_mdf.interfaces.pytorch.exporter
+except ModuleNotFoundError:
+    pytest.mark.skip(
+        "Skipping PyTorch interface tests because pytorch is not installed."
     )
 
-    _check_model(mdf_model)
+from pathlib import Path
 
 
-def test_simple_function():
-    """Test a simple function"""
+@pytest.fixture(autouse=True)
+def add_repo_root_to_syspath():
+    """
+    This fixture sets up and tears down state before each test is run. These tests import from
+    examples. Make sure syspath is set properly with the repo root.
+    """
 
-    def simple(x, y):
-        return x + y
+    # Get the current directory before running the test
+    repo_root = Path(__file__).parent.parent.parent.parent
+    old_sys_path = copy.copy(sys.path)
+    sys.path.append(str(repo_root))
 
-    mdf_model, param_dict = pytorch_to_mdf(
-        model=simple,
-        args=(torch.tensor(0.0), torch.tensor(0.0)),
-        example_outputs=(torch.tensor(0.0)),
-        use_onnx_ops=True,
-    )
+    yield
 
-    _check_model(mdf_model)
+    sys.path = old_sys_path
 
 
-def test_inception(inception_model_pytorch):
-    """Test the InceptionBlocks model that WebGME folks provided us."""
+def test_ABCD():
+    from examples.PyTorch.MDF_PyTorch import ABCD_pytorch
 
-    galaxy_images_output = torch.zeros((1, 5, 64, 64))
-    ebv_output = torch.zeros((1,))
-    # Run the model once to get some ground truth outpot (from PyTorch)
-    output = inception_model_pytorch(galaxy_images_output, ebv_output).detach().numpy()
+    base_path = Path(__file__).parent
 
-    # Convert to MDF
-    mdf_model, params_dict = pytorch_to_mdf(
-        model=inception_model_pytorch,
-        args=(galaxy_images_output, ebv_output),
-        example_outputs=output,
-        trace=True,
-    )
+    filename = "examples/MDF/ABCD.json"
+    file_path = (base_path / "../../.." / filename).resolve()
+    k = []
+    for i in ABCD_pytorch.res:
+        k.append(round(i.item(0), 3))
 
-    # Get the graph
-    mdf_graph = mdf_model.graphs[0]
+    # Get the result of MDF execution
+    eg = modeci_mdf.execution_engine.main(str(file_path))
+    assert eg.enodes["A"].evaluable_outputs["out_port"].curr_value == k[1]
+    assert round(eg.enodes["B"].evaluable_outputs["out_port"].curr_value, 3) == k[2]
+    assert round(eg.enodes["C"].evaluable_outputs["out_port"].curr_value, 3) == k[3]
+    assert round(eg.enodes["D"].evaluable_outputs["out_port"].curr_value, 3) == k[4]
 
-    # Add inputs to the parameters dict so we can feed this to the EvaluableGraph for initialization of all
-    # graph inputs.
-    params_dict["input1"] = galaxy_images_output.numpy()
-    params_dict["input2"] = ebv_output.numpy()
 
-    eg = EvaluableGraph(graph=mdf_graph, verbose=False)
+def test_Arrays():
+    from examples.PyTorch.MDF_PyTorch import Arrays_pytorch
 
-    eg.evaluate(initializer=params_dict)
+    base_path = Path(__file__).parent
 
-    assert np.allclose(
-        output,
-        eg.enodes["Add_381"].evaluable_outputs["_381"].curr_value,
+    filename = "examples/MDF/Arrays.json"
+    file_path = (base_path / "../../.." / filename).resolve()
+
+    k = Arrays_pytorch.res[1]
+
+    # # Get the result of MDF execution
+    eg = modeci_mdf.execution_engine.main(str(file_path))
+    output = eg.enodes["middle_node"].evaluable_outputs["output_1"].curr_value
+    assert output[0, 0] == k[0, 0]
+    assert output[0, 1] == k[0, 1]
+    assert output[1, 1] == k[1, 1]
+
+
+def test_Simple():
+    from examples.PyTorch.MDF_PyTorch import Simple_pytorch
+
+    base_path = Path(__file__).parent
+
+    filename = "examples/MDF/Simple.json"
+    file_path = (base_path / "../../.." / filename).resolve()
+    k = []
+    for i in Simple_pytorch.res:
+        k.append(round(i.item(0), 3))
+
+    # Get the result of MDF execution
+    eg = modeci_mdf.execution_engine.main(str(file_path))
+    assert eg.enodes["input_node"].evaluable_outputs["out_port"].curr_value == k[0]
+    assert (
+        round(eg.enodes["processing_node"].evaluable_outputs["output_1"].curr_value, 3)
+        == k[1]
     )
 
 
 if __name__ == "__main__":
-    test_simple_module()
+    test_ABCD()
+    test_Arrays()
+    test_Simple()

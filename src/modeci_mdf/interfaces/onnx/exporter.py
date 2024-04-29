@@ -12,10 +12,14 @@ from onnx import helper, shape_inference
 from onnx import AttributeProto, TensorProto, GraphProto
 from onnx.defs import get_schema
 
+import onnxruntime
+
 from ast import literal_eval
 
 import argparse
 import os
+
+import numpy
 
 
 def mdf_to_onnx(mdf_model):
@@ -42,7 +46,27 @@ def mdf_to_onnx(mdf_model):
         onnx_graph = generate_onnx_graph(graph, nodenames_in_execution_order)
 
         # Make an onnx model from graph
-        onnx_model = helper.make_model(onnx_graph)
+
+        # Check to see if onnxruntime version is less than 1.15, if so ir_version should
+        # be 8 for now. See: https://github.com/microsoft/onnxruntime/issues/15874
+        # There is still now programmatic way to determine the max supported ir_version from onnxruntime
+        # Here is the issue: https://github.com/microsoft/onnxruntime/issues/14932
+        # We will have to continue this dumb hack for the time being.
+        make_model_kwargs = {}
+        try:
+            from packaging.version import Version, InvalidVersion
+
+            v = Version(onnxruntime.__version__)
+
+            if v < Version("1.15"):
+                make_model_kwargs = {"ir_version": 8}
+            elif v < Version("1.18"):
+                make_model_kwargs = {"ir_version": 9}
+
+        except (InvalidVersion, ModuleNotFoundError):
+            pass
+
+        onnx_model = helper.make_model(onnx_graph, **make_model_kwargs)
 
         # Infer shapes
         onnx_model = shape_inference.infer_shapes(onnx_model)
@@ -105,7 +129,7 @@ def generate_onnx_node(node, graph):
     # If there are multiple functions, the code should change so that each function should become its own node.
     for param in node.parameters:
         # If this is a constant
-        if param.value:
+        if type(param.value) == int or type(param.value) == float:
             # Create a constant onnx node
             name = node.id + "_" + param.id
             constant = helper.make_tensor(
@@ -140,14 +164,12 @@ def generate_onnx_node(node, graph):
         sender_port_name[in_edge.receiver_port] = (
             in_edge.sender + "_" + in_edge.sender_port
         )
-
     onnx_node_input_names = [
         sender_port_name[function_input_name]
         if function_input_name in sender_port_name
         else function_input_name
         for function_input_name in function_input_names
     ]
-
     # No parameters. Constants became their own nodes earlier
     onnx_node_parameters = {}
 
@@ -177,9 +199,8 @@ def generate_onnx_node(node, graph):
     if input_ports_without_edge:
         # Create ONNX graph input ports
         for input_port in input_ports_without_edge:
-            shape = literal_eval(input_port.shape)
             value_info = helper.make_tensor_value_info(
-                input_port.id, TensorProto.FLOAT, shape
+                input_port.id, TensorProto.FLOAT, input_port.shape
             )
             onnx_graph_inputs.append(value_info)
 

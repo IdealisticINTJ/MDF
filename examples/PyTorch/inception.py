@@ -1,5 +1,6 @@
 import numpy as np
 import torch
+import os
 import torch.nn as nn
 
 from modeci_mdf.interfaces.pytorch import pytorch_to_mdf
@@ -263,11 +264,15 @@ def main():
     # Run the model once to get some ground truth outpot (from PyTorch)
     output = model(galaxy_images_output, ebv_output).detach().numpy()
 
+    from modelspec.utils import _val_info
+
+    # print("Inputs: %s, %s"% (_val_info(galaxy_images_output),_val_info(ebv_output)))
+    print("Evaluated the graph in PyTorch, output: %s" % (_val_info(output)))
+
     # Convert to MDF
     mdf_model, params_dict = pytorch_to_mdf(
         model=model,
         args=(galaxy_images_output, ebv_output),
-        example_outputs=output,
         trace=True,
     )
 
@@ -282,11 +287,14 @@ def main():
     # Evaluate the model via the MDF scheduler
     eg = EvaluableGraph(graph=mdf_graph, verbose=False)
     eg.evaluate(initializer=params_dict)
+    output_mdf = eg.output_enodes[0].get_output()
 
-    # Make sure the results are the same betweeen PyTorch and MDF
+    print("Evaluated the graph in PyTorch, output: %s" % (_val_info(output_mdf)))
+
+    # Make sure the results are the same between PyTorch and MDF
     assert np.allclose(
         output,
-        eg.enodes["Add_381"].evaluable_outputs["_381"].curr_value,
+        output_mdf,
     )
     print("Passed all comparison tests!")
 
@@ -302,7 +310,11 @@ def main():
             view_on_render=False,
             level=1,
             filename_root="inception",
-            only_warn_on_fail=True,  # Makes sure test of this doesn't fail on Windows on GitHub Actions
+            only_warn_on_fail=(
+                os.name == "nt"
+            ),  # Makes sure test of this doesn't fail on Windows on GitHub Actions
+            is_horizontal=True,
+            solid_color=True,
         )
 
 

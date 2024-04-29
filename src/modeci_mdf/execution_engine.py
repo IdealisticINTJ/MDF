@@ -11,27 +11,32 @@ of the :class:`EvaluableGraph` class. The external library `graph-scheduler
 conditional constraints.
 
 """
+import ast
+import builtins
+import copy
 import functools
 import inspect
+import itertools
 import os
 import re
 import sys
-import sympy
-import numpy as np
+import math
 
+import attr
+import numpy as np
 
 import graph_scheduler
 import onnxruntime
 
 from modeci_mdf.functions.standard import mdf_functions, create_python_expression
-from modeci_mdf.utils import is_number
+
 
 from modelspec.utils import evaluate as evaluate_params_modelspec
 from modelspec.utils import _params_info, _val_info
 from modelspec.utils import FORMAT_NUMPY
 
 from collections import OrderedDict
-from typing import Union, List, Dict, Optional, Any
+from typing import Union, List, Dict, Optional, Any, Tuple
 from modeci_mdf.mdf import (
     Function,
     Graph,
@@ -45,17 +50,22 @@ from modeci_mdf.mdf import (
 
 import modeci_mdf.functions.onnx as onnx_ops
 import modeci_mdf.functions.actr as actr_funcs
+import modeci_mdf.functions.ddm as ddm_funcs
 
 
 FORMAT_DEFAULT = FORMAT_NUMPY
 
-KNOWN_PARAMETERS = ["constant"]
+KNOWN_PARAMETERS = ["constant", "math", "numpy"] + dir(builtins)
+
+
+time_scale_str_regex = r"(TimeScale)?\.(.*)"
 
 
 def evaluate_expr(
     expr: Union[str, List[str], np.ndarray, "tf.tensor"] = None,
     func_params: Dict[str, Any] = None,
     array_format: str = FORMAT_DEFAULT,
+    allow_strings_returned: Optional[bool] = False,
     verbose: Optional[bool] = False,
 ) -> np.ndarray:
 
@@ -65,6 +75,7 @@ def evaluate_expr(
         expr: Expression or list of expressions to be evaluated
         func_params: A dict of parameters (e.g. :code:`{'weight': 2}`)
         array_format: It can be a n-dimensional array or a tensor
+        allow_strings_returned: Don't throw an error if the expression evaluates to a string
         verbose: If set to True provides in-depth information else verbose message is not displayed
 
     Returns:
@@ -75,10 +86,10 @@ def evaluate_expr(
     e = evaluate_params_modelspec(
         expr, func_params, array_format=array_format, verbose=verbose
     )
-    if type(e) == str and e not in KNOWN_PARAMETERS:
+    if type(e) == str and e not in KNOWN_PARAMETERS and not allow_strings_returned:
         raise Exception(
             "Error! Could not evaluate expression [%s] with params %s, returned [%s] which is a %s"
-            % (expr, _params_info(func_params), e, type(e))
+            % (expr, _params_info(func_params, multiline=True), e, type(e))
         )
     return e
 
@@ -130,21 +141,29 @@ def evaluate_onnx_expr(
     # kwargs. Lets construct this.
     kwargs_for_onnx = {}
     for kw, arg_expr in base_parameters.items():
+        if isinstance(arg_expr, str):
+            arg_expr_list = get_required_variables_from_expression(arg_expr)
+            for a in arg_expr_list:
+                try:
+                    kwargs_for_onnx[a] = evaluated_parameters[a]
+                except KeyError:
+                    pass
 
-        # If this arg is a list of args, we are dealing with a variadic argument. Expand these
-        if type(arg_expr) == str and arg_expr[0] == "[" and arg_expr[-1] == "]":
-            # Use the Python interpreter to parse this into a List[str]
-            arg_expr_list = parse_str_as_list(arg_expr[1:-1])
-            kwargs_for_onnx.update({a: evaluated_parameters[a] for a in arg_expr_list})
-        else:
-            kwargs_for_onnx[kw] = evaluated_parameters[kw]
+            try:
+                if arg_expr[0] == "[" and arg_expr[-1] == "]":
+                    # matches previous behavior
+                    continue
+            except IndexError:
+                pass
+
+        kwargs_for_onnx[kw] = evaluated_parameters[kw]
 
     kwargs_for_onnx = {
         k: v
         for k, v in kwargs_for_onnx.items()
         if (
             (k in onnx_arguments or has_variadic)
-            and "onnx::" not in k  # filter Evaluable__ class names
+            and "onnx_" not in k  # filter Evaluable__ class names
         )
     }
 
@@ -201,70 +220,62 @@ def evaluate_onnx_expr(
     return result
 
 
-def parse_str_as_list(s: str) -> list:
-    """Produces a list from its string representation. Runs `eval` on
-    non-list elements within
+def get_required_variables_from_expression(expr: str) -> List[str]:
+    """Produces a list containing variable symbols in **expr**"""
 
-    Args:
-        s (str): a string representing a list
-
-    Returns:
-        list: a list containing elements from **s**
-    """
-
-    def try_eval_str(t):
-        try:
-            return eval(t)
-        except (NameError, SyntaxError):
-            return t
-
-    def _parse_str_as_list(t):
+    def recursively_extract_subscripted_values(s):
         res = []
-        i = 0
-        j = 0
+        subscript_indices = []
         depth = 0
 
-        t = t.replace(" ", "")
-
-        while j < len(t):
-            if t[j] == "[":
+        len_s = len(s)
+        for i in range(len_s):
+            if s[i] == "[":
+                if depth == 0:
+                    subscript_indices.append([i, None])
                 depth += 1
 
-            if t[j] == "]":
+            if s[i] == "]":
                 depth -= 1
 
                 if depth == 0:
-                    res.append(_parse_str_as_list(t[i + 1 : j]))
-                    # also passes this check if at end of string
-                    if t[j : j + 1] not in ",]":
-                        raise ValueError(f"Malformed input at index {j} of {t} {t[j]}")
-                    i = j + 1
+                    subscript_indices[-1][1] = i
 
-            if t[j] == ",":
-                if depth == 0:
-                    if j > i:
-                        res.append(try_eval_str(t[i:j]))
-                    i = j + 1
+        # s contains no subscripts, so it won't be added in below loop
+        if len(subscript_indices) == 0 and len_s > 0:
+            res.append(s)
 
-            j = j + 1
+        last = 0
+        for start, end in subscript_indices:
+            if end is None:
+                end = len_s
 
-        if depth > 0:
-            raise ValueError(f"Unmatched opening bracket in {t}")
-        elif depth < 0:
-            raise ValueError(f"Unmatched closing bracket in {t}")
+            res.extend(recursively_extract_subscripted_values(s[start + 1 : end]))
 
-        if j > i:
-            res.append(try_eval_str(t[i:j]))
+            # add expression being subscripted
+            if last != start:
+                res.append(s[last:start])
+
+            last = end + 1
 
         return res
 
-    res = _parse_str_as_list(s)
+    if not isinstance(expr, str):
+        return []
 
-    # avoid adding extra unnecessary list
-    if len(res) == 1:
-        return res[0]
-    else:
-        return res
+    result = []
+
+    for e in recursively_extract_subscripted_values(expr):
+        result.extend(
+            [
+                str(elem.id)
+                for elem in ast.walk(
+                    ast.parse(e.strip(" ,+-*/%^&").lstrip("])").rstrip("[("))
+                )
+                if isinstance(elem, ast.Name)
+            ]
+        )
+    return result
 
 
 class EvaluableFunction:
@@ -303,15 +314,11 @@ class EvaluableFunction:
         # func_val  = self.function.value
 
         if self.function.function:
-
             for f in mdf_functions:
-
-                if f in self.function.function.keys():
-
+                if f == self.function.function:
                     expr = create_python_expression(
                         mdf_functions[f]["expression_string"]
                     )
-
                     break
 
         if expr is None:
@@ -328,27 +335,21 @@ class EvaluableFunction:
                 "    Evaluating %s with %s, i.e. [%s]"
                 % (self.function, _params_info(func_params), expr)
             )
-        if self.function.function:
 
-            for f in mdf_functions:
-
-                if f in self.function.function.keys():
-
-                    for arg in self.function.function[f].keys():
-
-                        func_params[arg] = evaluate_expr(
-                            self.function.function[f][arg],
-                            func_params,
-                            verbose=False,
-                            array_format=array_format,
+        if self.function.args is not None:
+            for arg in self.function.args:
+                func_params[arg] = evaluate_expr(
+                    self.function.args[arg],
+                    func_params,
+                    verbose=False,
+                    array_format=array_format,
+                )
+                if self.verbose:
+                    print(
+                        "      Arg: {} became: {}".format(
+                            arg, _val_info(func_params[arg])
                         )
-                        if self.verbose:
-                            print(
-                                "      Arg: {} became: {}".format(
-                                    arg, _val_info(func_params[arg])
-                                )
-                            )
-                    break
+                    )
 
         # If this is an ONNX operation, evaluate it without modelspec.
 
@@ -367,6 +368,11 @@ class EvaluableFunction:
             self.curr_value = actr_function(
                 *[func_params[arg] for arg in self.function.args]
             )
+        elif "ddm." in expr:
+            actr_function = getattr(ddm_funcs, expr.split("(")[0].split(".")[-1])
+            self.curr_value = ddm_function(
+                *[func_params[arg] for arg in self.function.args]
+            )
         else:
             self.curr_value = evaluate_expr(
                 expr, func_params, verbose=self.verbose, array_format=array_format
@@ -382,59 +388,56 @@ class EvaluableFunction:
 
 class EvaluableParameter:
     """
-    Evaluates the current value of a :class:`~modeci_mdf.mdf.Parameter` during MDF graph execution.
+    Evaluates the current value of a :class:`~modeci_mdf.mdf.Parameter` during the MDF graph execution.
 
     Args:
         parameter: The parameter to evaluate during execution.
         verbose: Whether to print output of parameter calculations.
+
     """
 
-    DEFAULT_INIT_VALUE = 0  # Temporary!
+    DEFAULT_INIT_VALUE = 0.0  # Temporary!
 
     def __init__(self, parameter: Parameter, verbose: bool = False):
+
         self.verbose = verbose
         self.parameter = parameter
-
-        if self.parameter.default_initial_value is not None:
-            if is_number(self.parameter.default_initial_value):
-
-                self.curr_value = float(self.parameter.default_initial_value)
-
-            else:
-                try:
-                    self.curr_value = evaluate_expr(
-                        self.parameter.default_initial_value,
-                        None,
-                    )
-                # evaluate_expr raises Exception
-                except Exception:
-                    self.curr_value = self.parameter.default_initial_value
-        else:
-            self.curr_value = None
+        self.curr_value = None
 
     def get_current_value(
         self, parameters: Dict[str, Any], array_format: str = FORMAT_DEFAULT
     ) -> Any:
         """
-        Get the current value of the parameter; evaluates the expression if needed.
+        Get the current value of the parameter; evaluates the expression if the current value has not yet been set. Note:
+        this is different from :code:`'evaluate'`, as calling that method multiple times can change the state of the parameter,
+        but calling this should not reevaluate the parameter if it has a current value.
 
         Args:
-            parameters: a dictionary  of parameters and their values that may or may not be needed to evaluate this
+            parameters: a dictionary of parameters and their values that may or may not be needed to evaluate this
                 parameter.
             array_format: The array format to use (either :code:`'numpy'` or :code:`tensorflow'`).
 
         Returns:
             The evaluated value of the parameter.
-        """
 
+        """
         # FIXME: Shouldn't this just call self.evaluate, seems like there is redundant code here?
         if self.curr_value is None:
-
-            if self.parameter.value is not None:
+            if (
+                self.parameter.value is not None
+                or self.parameter.default_initial_value is not None
+            ):
                 if self.parameter.is_stateful():
+                    if self.verbose:
+                        print(f"    Initial eval of <{self.parameter.summary()}>  ")
 
                     if self.parameter.default_initial_value is not None:
-                        return self.parameter.default_initial_value
+                        return evaluate_expr(
+                            self.parameter.default_initial_value,
+                            parameters,
+                            verbose=self.verbose,
+                            array_format=array_format,
+                        )
                     else:
                         return self.DEFAULT_INIT_VALUE
                 else:
@@ -444,7 +447,7 @@ class EvaluableParameter:
                     self.curr_value = evaluate_expr(
                         self.parameter.value,
                         ips,
-                        verbose=False,
+                        verbose=self.verbose,
                         array_format=array_format,
                     )
                     if self.verbose:
@@ -466,7 +469,7 @@ class EvaluableParameter:
         Evaluate the parameter and store the result in the :code:`curr_value` attribute.
 
         Args:
-            parameters: a dictionary  of parameters and their values that may or may not be needed to evaluate this
+            parameters: a dictionary of parameters and their values that may or may not be needed to evaluate this
                 parameter.
             time_increment: a floating point value specifying the timestep size, only used for :code:`time_derivative`
                 parameters
@@ -474,11 +477,12 @@ class EvaluableParameter:
 
         Returns:
             The current value of the parameter.
+
         """
         if self.verbose:
             print(
                 "    Evaluating {} with {} ".format(
-                    self.parameter, _params_info(parameters)
+                    self.parameter.summary(), _params_info(parameters)
                 )
             )
 
@@ -490,6 +494,7 @@ class EvaluableParameter:
                 verbose=False,
                 array_format=array_format,
             )
+
         elif self.parameter.function:
             expr = None
             for f in mdf_functions:
@@ -544,15 +549,19 @@ class EvaluableParameter:
                 )
             else:
                 self.curr_value = evaluate_expr(
-                    expr, func_params, verbose=self.verbose, array_format=array_format
+                    expr,
+                    func_params,
+                    verbose=self.verbose,
+                    array_format=array_format,
                 )
-        else:
-            if time_increment == None:
 
+        elif self.parameter.time_derivative is not None:
+
+            if time_increment == None:
                 self.curr_value = evaluate_expr(
                     self.parameter.default_initial_value,
                     parameters,
-                    verbose=False,
+                    verbose=self.verbose,
                     array_format=array_format,
                 )
 
@@ -560,16 +569,57 @@ class EvaluableParameter:
                 td = evaluate_expr(
                     self.parameter.time_derivative,
                     parameters,
+                    verbose=self.verbose,
+                    array_format=array_format,
+                )
+                if self.verbose:
+                    print(
+                        f"Incrementing {self.parameter.id} from {self.curr_value} by {td} over time {time_increment}"
+                    )
+
+                self.curr_value = np.add(
+                    self.curr_value, td * time_increment, casting="safe"
+                )
+
+        cond_mask = None
+        val_if_true = None
+
+        if len(self.parameter.conditions) > 0:
+            for condition in self.parameter.conditions:
+                cond_mask = evaluate_expr(
+                    condition.test,
+                    parameters,
                     verbose=False,
                     array_format=array_format,
                 )
 
-                self.curr_value += td * time_increment
+                val_if_true = evaluate_expr(
+                    condition.value,
+                    parameters,
+                    verbose=False,
+                    array_format=array_format,
+                )
+
+                if self.verbose:
+                    print(
+                        " --- Condition: %s: %s = %s: true? %s"
+                        % (condition.id, condition.test, val_if_true, cond_mask)
+                    )
+
+                # e.g. if the parameter value is set only by a set of conditions...
+                if self.curr_value is None:
+                    self.curr_value = self.DEFAULT_INIT_VALUE
+
+                self.curr_value = np.where(cond_mask, val_if_true, self.curr_value)
 
         if self.verbose:
             print(
-                "    Evaluated %s with %s \n       =\t%s"
-                % (self.parameter, _params_info(parameters), _val_info(self.curr_value))
+                "    Evaluated this: %s with %s \n       =\t%s"
+                % (
+                    self.parameter.summary(),
+                    _params_info(parameters),
+                    _val_info(self.curr_value),
+                )
             )
 
         return self.curr_value
@@ -586,6 +636,7 @@ class EvaluableOutput:
     def __init__(self, output_port: OutputPort, verbose: Optional[bool] = False):
         self.verbose = verbose
         self.output_port = output_port
+        self.curr_value = None
 
     def evaluate(
         self,
@@ -635,7 +686,10 @@ class EvaluableInput:
     def __init__(self, input_port: InputPort, verbose: Optional[bool] = False):
         self.verbose = verbose
         self.input_port = input_port
-        self.curr_value = 0
+        default = 0
+        if input_port.type and "float" in input_port.type:
+            default = 0.0
+        self.curr_value = np.full(input_port.shape, default)
 
     def set_input_value(self, value: Union[str, int, np.ndarray]):
         """Set a new value at input port
@@ -662,7 +716,7 @@ class EvaluableInput:
         """
         if self.verbose:
             print(
-                "    Evaluated %s with %s =\t%s"
+                "    Evaluated %s with params %s =\t%s"
                 % (
                     self.input_port,
                     _params_info(parameters),
@@ -710,7 +764,12 @@ class EvaluableNode:
             all_known_vars.append(p.id)
             # params_init[s] = s.curr_value"""
 
+        # TODO: the below checks for evaluability of functions and
+        # parameters using known variables are very similar and could be
+        # simplified with a function
         all_funcs = [f for f in node.functions]
+        num_funcs_remaining = {f.id: None for f in node.functions}
+        func_missing_vars = {f.id: [] for f in node.functions}
 
         # Order the functions into the correct sequence
         while len(all_funcs) > 0:
@@ -725,26 +784,27 @@ class EvaluableNode:
                 for arg in f.args:
                     arg_expr = f.args[arg]
 
-                    # some non-expression/str types will crash in sympy.simplify
-                    if not isinstance(arg_expr, (sympy.Expr, str)):
-                        continue
-
                     # If we are dealing with a list of symbols, each must treated separately
-                    if (
-                        type(arg_expr) == str
-                        and arg_expr[0] == "["
-                        and arg_expr[-1] == "]"
-                    ):
-                        # Use the Python interpreter to parse this into a List[str]
-                        arg_expr_list = parse_str_as_list(arg_expr)
-                    else:
-                        arg_expr_list = [arg_expr]
-
-                    for e in arg_expr_list:
-                        func_expr = sympy.simplify(e)
-                        all_req_vars.extend([str(s) for s in func_expr.free_symbols])
+                    all_req_vars.extend(
+                        [
+                            v
+                            for v in get_required_variables_from_expression(arg_expr)
+                            if v not in f.args
+                        ]
+                    )
+            if f.value is not None:
+                all_req_vars.extend(
+                    [
+                        v
+                        for v in get_required_variables_from_expression(f.value)
+                        if f.args is None or v not in f.args
+                    ]
+                )
 
             all_present = [v in all_known_vars for v in all_req_vars]
+            func_missing_vars[f.id] = {
+                v for v in all_req_vars if v not in all_known_vars
+            }
 
             if verbose:
                 print(
@@ -759,14 +819,31 @@ class EvaluableNode:
             #     params_init, array_format=FORMAT_DEFAULT
             # )
             else:
-                if len(all_funcs) == 0:
-                    raise Exception(
-                        "Error! Could not evaluate function: %s with args %s using known vars %s"
-                        % (f.id, f.args, all_known_vars)
+                # track the number of remaining functions each time f
+                # is examined. If it's the same as last time, we know
+                # every function was examined and nothing changed, so
+                # we can stop because otherwise it will just infinitely
+                # loop
+                if num_funcs_remaining[f.id] == len(all_funcs):
+                    func_missing_vars = {
+                        f: ", ".join(v) for f, v in func_missing_vars.items()
+                    }
+                    raise ValueError(
+                        "Error! Could not evaluate functions using known vars. The following vars are missing:\n\t"
+                        + "\n\t".join(
+                            f"{f}: {v}"
+                            for f, v in func_missing_vars.items()
+                            if len(v) > 0
+                        )
                     )
                 else:
+                    num_funcs_remaining[f.id] = len(all_funcs)
                     all_funcs.append(f)
+
         all_params_to_check = [p for p in node.parameters]
+        num_params_remaining = {p.id: None for p in node.parameters}
+        param_missing_vars = {f.id: [] for f in node.parameters}
+
         if self.verbose:
             print("all_params_to_check: %s" % all_params_to_check)
 
@@ -782,37 +859,33 @@ class EvaluableNode:
             all_req_vars = []
 
             if p.value is not None and type(p.value) == str:
-                if p.value[0] == "[" and p.value[-1] == "]":
-                    # Use the Python interpreter to parse this into a List[str]
-                    arg_expr_list = parse_str_as_list(p.value)
-                else:
-                    arg_expr_list = [p.value]
-
-                for e in arg_expr_list:
-                    param_expr = sympy.simplify(e)
-                    all_req_vars.extend([str(s) for s in param_expr.free_symbols])
+                all_req_vars.extend(
+                    [
+                        v
+                        for v in get_required_variables_from_expression(p.value)
+                        if p.args is None or v not in p.args
+                    ]
+                )
 
             if p.args is not None:
                 for arg in p.args:
                     arg_expr = p.args[arg]
-
-                    # If we are dealing with a list of symbols, each must treated separately
-                    if (
-                        type(arg_expr) == str
-                        and arg_expr[0] == "["
-                        and arg_expr[-1] == "]"
-                    ):
-                        # Use the Python interpreter to parse this into a List[str]
-                        arg_expr_list = parse_str_as_list(arg_expr)
-                    else:
-                        arg_expr_list = [arg_expr]
-
-                    for e in arg_expr_list:
-                        param_expr = sympy.simplify(e)
-                        all_req_vars.extend([str(s) for s in param_expr.free_symbols])
+                    if isinstance(arg_expr, str):
+                        all_req_vars.extend(
+                            [
+                                v
+                                for v in get_required_variables_from_expression(
+                                    arg_expr
+                                )
+                                if v not in p.args
+                            ]
+                        )
 
             all_known_vars_plus_this = all_known_vars + [p.id]
             all_present = [v in all_known_vars_plus_this for v in all_req_vars]
+            param_missing_vars[p.id] = {
+                v for v in all_req_vars if v not in all_known_vars
+            }
 
             if verbose:
                 print(
@@ -830,26 +903,39 @@ class EvaluableNode:
                 all_known_vars.append(p.id)
 
             else:
-                if len(all_params_to_check) == 0:
-                    raise Exception(
-                        "Error! Could not evaluate parameter: %s with args %s using known vars %s"
-                        % (p.id, p.args, all_known_vars_plus_this)
+                if num_params_remaining[p.id] == len(all_params_to_check):
+                    param_missing_vars = {
+                        p: ", ".join(v) for p, v in param_missing_vars.items()
+                    }
+                    raise ValueError(
+                        "Error! Could not evaluate parameters using known vars. The following vars are missing:\n\t"
+                        + "\n\t".join(
+                            f"{p}: {v}"
+                            for p, v in param_missing_vars.items()
+                            if len(v) > 0
+                        )
                     )
                 else:
+                    num_params_remaining[p.id] = len(all_params_to_check)
                     all_params_to_check.append(p)  # Add back to end of list...
 
         for op in node.output_ports:
             rop = EvaluableOutput(op, self.verbose)
             self.evaluable_outputs[op.id] = rop
 
-    def initialize(self):
-        pass
-
     def evaluate(
         self,
         time_increment: Union[int, float] = None,
         array_format: str = FORMAT_DEFAULT,
     ):
+        """
+        Evaluate the Node for one time-step
+
+        Args:
+            time_increment: The time-increment to use for this evaluation.
+            array_format: The format to use for arrays.
+
+        """
 
         if self.verbose:
             print(
@@ -885,19 +971,29 @@ class EvaluableNode:
         for eop in self.evaluable_outputs:
             self.evaluable_outputs[eop].evaluate(curr_params, array_format=array_format)
 
-    def get_output(self, id: str) -> Union[int, np.ndarray]:
+    def get_output(self, id: str = None) -> Union[int, np.ndarray, Tuple]:
         """Get value at output port for given output port's id
 
         Args:
-            id: Unique identifier of the output port
+            id: Unique identifier of the output port. If None, return a tuple for all output ports.
 
         Returns:
-            value at the output port
+            value at the output port. If id is None, return all outputs as a tuple. If there is only
+            one output, return just its value.
 
         """
-        for rop in self.evaluable_outputs:
-            if rop == id:
-                return self.evaluable_outputs[rop].curr_value
+        if id is not None:
+            for rop in self.evaluable_outputs:
+                if rop == id:
+                    return self.evaluable_outputs[rop].curr_value
+        else:
+            outputs = tuple(
+                self.evaluable_outputs[rop].curr_value for rop in self.evaluable_outputs
+            )
+            if len(outputs) == 1:
+                return outputs[0]
+            else:
+                return outputs
 
 
 class EvaluableGraph:
@@ -916,7 +1012,11 @@ class EvaluableGraph:
         self.graph = graph
         self.enodes = {}
         self.root_nodes = []
+        self.output_nodes = []
+        self.order_of_execution = []
 
+        # Get the root (input nodes) of the graph. We will assume all are root nodes
+        # and then remove those that have edges to them.
         for node in graph.nodes:
             if self.verbose:
                 print("\n  Init node: %s" % node.id)
@@ -946,24 +1046,47 @@ class EvaluableGraph:
                 evaluated_nodes.append(edge.receiver)
 
         if self.graph.conditions is not None:
-            conditions = {
-                self.graph.get_node(node): self.parse_condition(cond)
-                for node, cond in self.graph.conditions.node_specific.items()
-            }
+            if self.graph.conditions.node_specific is None:
+                conditions = {}
+            else:
+                conditions = {
+                    self.graph.get_node(node): self.parse_condition(cond)
+                    for node, cond in self.graph.conditions.node_specific.items()
+                }
 
-            termination_conds = {
-                scale: self.parse_condition(cond)
-                for scale, cond in self.graph.conditions.termination.items()
-            }
+            termination_conds = {}
+            if self.graph.conditions.termination is not None:
+                for scale, cond in self.graph.conditions.termination.items():
+                    cond = self.parse_condition(cond)
+
+                    # check for TimeScale in form of enum or equivalent unambiguous strings
+                    try:
+                        scale = re.match(time_scale_str_regex, scale).groups()[1]
+                    except (AttributeError, IndexError, TypeError):
+                        pass
+
+                    try:
+                        termination_conds[graph_scheduler.TimeScale[scale]] = cond
+                    except KeyError:
+                        termination_conds[scale] = cond
         else:
             conditions = {}
             termination_conds = {}
-
         self.scheduler = graph_scheduler.Scheduler(
             graph=self.graph.dependency_dict,
             conditions=conditions,
             termination_conds=termination_conds,
         )
+
+        # We also need to get the output nodes
+        self.output_nodes = [
+            n
+            for n in self.graph.nodes
+            if n.id not in (e.sender for e in self.graph.edges)
+        ]
+
+        # Lets also get the corresponding EvaluableNode for outputs
+        self.output_enodes = [self.enodes[n.id] for n in self.output_nodes]
 
     def evaluate(
         self,
@@ -1018,6 +1141,7 @@ class EvaluableGraph:
                     % self.scheduler.get_clock(None).simple_time
                 )
             for node in ts:
+                self.order_of_execution.append(node.id)
                 for edge in incoming_edges[node]:
                     self.evaluate_edge(
                         edge, time_increment=time_increment, array_format=array_format
@@ -1027,7 +1151,8 @@ class EvaluableGraph:
                 )
 
         if self.verbose:
-            print("Trial terminated")
+            print("> Order of execution of nodes: %s" % self.order_of_execution)
+            print("\n Trial terminated")
 
     def evaluate_edge(
         self,
@@ -1062,11 +1187,14 @@ class EvaluableGraph:
                     _val_info(weight),
                 )
             )
-        input_value = value if weight == 1 else value * weight
+        if (type(weight) == int or type(weight) == float) and weight == 1:
+            input_value = value
+        else:
+            input_value = weight * value
         post_node.evaluable_inputs[edge.receiver_port].set_input_value(input_value)
 
     def parse_condition(
-        self, condition: Union[Condition, dict]
+        self, condition: Union[Condition, Dict]
     ) -> graph_scheduler.Condition:
         """Convert the condition in a specific format
 
@@ -1078,7 +1206,33 @@ class EvaluableGraph:
 
         """
 
-        def substitute_condition_arguments(condition, condition_type):
+        def get_custom_parameter_getter(eobj):
+            # try to pick a default based on expected shape of the
+            # evaluable object before it has ever been executed
+            for d in [
+                lambda: np.zeros(eobj.input_port.shape),
+                lambda: np.zeros(eobj.output_port.shape),
+                lambda: eobj.parameter.default_initial_value,
+            ]:
+                try:
+                    default = d()
+                except AttributeError:
+                    pass
+                else:
+                    break
+            else:
+                default = 0
+
+            def getter(dependency, parameter):
+                res = eobj.curr_value
+                if res is None:
+                    return default
+                else:
+                    return res
+
+            return getter
+
+        def update_condition_arguments(args, condition_type):
             # mdf format prefers the key name for all conditions that use it or
             # its value as an __init__ argument
             combined_condition_arguments = {"dependencies": "dependency"}
@@ -1086,26 +1240,68 @@ class EvaluableGraph:
 
             for preferred, actual in combined_condition_arguments.items():
                 if (
-                    preferred in condition.args
+                    preferred in condition.kwargs
                     and preferred not in sig.parameters
                     and actual in sig.parameters
                 ):
-                    condition.args[actual] = condition.args[preferred]
-                    del condition.args[preferred]
+                    args[actual] = args[preferred]
+                    del args[preferred]
+
+            if "custom_parameter_getter" in sig.parameters:
+                try:
+                    dependency = args["dependency"]
+                    parameter = args["parameter"]
+                except KeyError as e:
+                    raise ValueError(
+                        "Threshold condition did not specify dependency or parameter"
+                    ) from e
+
+                # self is EvaluableGraph condition is running under,
+                enode = self.enodes[dependency.id]
+                evaluable_objects = [
+                    enode.evaluable_inputs,
+                    enode.evaluable_parameters,
+                    enode.evaluable_functions,
+                    enode.evaluable_outputs,
+                ]
+                valid_parameters = itertools.chain.from_iterable(
+                    [obj for obj in evaluable_objects]
+                )
+                args["custom_parameter_validator"] = (
+                    lambda dependency, parameter: parameter in valid_parameters
+                )
+                # assumes a unique parameter id among evaluable objects for
+                # dependency, or will resolve in favor of first with that id
+                for obj in evaluable_objects:
+                    try:
+                        obj = obj[parameter]
+                    except KeyError:
+                        pass
+                    else:
+                        args["custom_parameter_getter"] = get_custom_parameter_getter(
+                            obj
+                        )
+                        break
+                else:
+                    raise ValueError(
+                        f"No {parameter} evaluable object for {dependency}, options: {list(valid_parameters)}"
+                    )
+
+            return args
 
         # if specified as dict
         try:
-            args = condition["args"]
-        except (TypeError, KeyError):
+            args = condition["kwargs"]
+        except (IndexError, TypeError, KeyError):
             args = {}
 
         try:
             condition = Condition(condition["type"], **args)
-        except (TypeError, KeyError):
+        except (IndexError, TypeError, KeyError):
             pass
 
         cond_type = condition.type
-        cond_args = condition.args
+        cond_args = copy.copy(condition.kwargs)
 
         try:
             typ = getattr(graph_scheduler.condition, cond_type)
@@ -1132,14 +1328,14 @@ class EvaluableGraph:
                     # value may be a string representing a TimeScale
                     cond_args[k] = getattr(
                         graph_scheduler.TimeScale,
-                        re.match(r"TimeScale\.(.*)", v).groups()[0],
+                        re.match(time_scale_str_regex, v).groups()[1],
                     )
                 except (AttributeError, IndexError, TypeError):
                     pass
             else:
                 cond_args[k] = new_v
 
-        substitute_condition_arguments(condition, typ)
+        cond_args = update_condition_arguments(cond_args, typ)
 
         try:
             return typ(**cond_args)
@@ -1171,9 +1367,6 @@ class EvaluableGraph:
                             if k != var_positional_arg
                         },
                     )
-
-
-from modelspec.utils import FORMAT_NUMPY
 
 
 def main(example_file: str, array_format: str = FORMAT_NUMPY, verbose: bool = False):

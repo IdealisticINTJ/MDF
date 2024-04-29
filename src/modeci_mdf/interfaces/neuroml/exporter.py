@@ -14,7 +14,9 @@ from modeci_mdf.functions.standard import mdf_functions, substitute_args
 from modeci_mdf.execution_engine import evaluate_expr
 
 
-def mdf_to_neuroml(graph, save_to=None, format=None, run_duration_sec=2):
+def mdf_to_neuroml(
+    graph, save_to=None, format=None, run_duration_sec=2, run_dt_sec=0.01
+):
 
     print("Converting graph: %s to NeuroML" % (graph.id))
 
@@ -35,7 +37,12 @@ def mdf_to_neuroml(graph, save_to=None, format=None, run_duration_sec=2):
 
         # Create the ComponentType which defines behaviour of the general class
         ct = lems.ComponentType(node_comp_type, extends="baseCellMembPotDL")
-        ct.add(lems.Attachments("only_input_port", "basePointCurrentDL"))
+
+        for ip in node.input_ports:
+            ct.add(lems.Attachments("ip_%s" % ip.id, "basePointCurrentDL"))
+        if len(node.input_ports) == 0:
+            ct.add(lems.Attachments("unused_attachments", "basePointCurrentDL"))
+
         ct.dynamics.add(
             lems.DerivedVariable(name="V", dimension="none", value="0", exposure="V")
         )
@@ -56,8 +63,8 @@ def mdf_to_neuroml(graph, save_to=None, format=None, run_duration_sec=2):
         )
         net.populations.append(pop)
 
-        if len(node.input_ports) > 1:
-            raise Exception("Currently only max 1 input port supported in NeuroML...")
+        # if len(node.input_ports) > 2:
+        #    raise Exception("Currently only max 1 input port supported in NeuroML...")
 
         for ip in node.input_ports:
             ct.add(lems.Exposure(ip.id, "none"))
@@ -65,7 +72,7 @@ def mdf_to_neuroml(graph, save_to=None, format=None, run_duration_sec=2):
                 lems.DerivedVariable(
                     name=ip.id,
                     dimension="none",
-                    select="only_input_port[*]/I",
+                    select="ip_%s[*]/I" % ip.id,
                     reduce="add",
                     exposure=ip.id,
                 )
@@ -74,23 +81,26 @@ def mdf_to_neuroml(graph, save_to=None, format=None, run_duration_sec=2):
         on_start = None
 
         for p in node.parameters:
-            print("Converting %s" % p)
+            print(" - Converting %s" % p)
             if p.value is not None:
-                try:
-                    v_num = float(p.value)
-                    ct.add(lems.Parameter(p.id, "none"))
-                    comp.parameters[p.id] = v_num
-                    print(comp.parameters[p.id])
-                except Exception as e:
-
-                    ct.add(lems.Exposure(p.id, "none"))
-                    dv = lems.DerivedVariable(
-                        name=p.id,
-                        dimension="none",
-                        value="%s" % (p.value),
-                        exposure=p.id,
-                    )
-                    ct.dynamics.add(dv)
+                if len(p.conditions) == 0:
+                    try:
+                        v_num = float(p.value)
+                        ct.add(lems.Parameter(p.id, "none"))
+                        comp.parameters[p.id] = v_num
+                        print(
+                            "   Standard parameter: %s = %s"
+                            % (p.id, comp.parameters[p.id])
+                        )
+                    except Exception as e:
+                        ct.add(lems.Exposure(p.id, "none"))
+                        dv = lems.DerivedVariable(
+                            name=p.id,
+                            dimension="none",
+                            value="%s" % (p.value),
+                            exposure=p.id,
+                        )
+                        ct.dynamics.add(dv)
 
             elif p.function is not None:
                 ct.add(lems.Exposure(p.id, "none"))
@@ -113,7 +123,12 @@ def mdf_to_neuroml(graph, save_to=None, format=None, run_duration_sec=2):
                         on_start = lems.OnStart()
                         ct.dynamics.add(on_start)
                     sa = lems.StateAssignment(
-                        variable=p.id, value=str(evaluate_expr(p.default_initial_value))
+                        variable=p.id,
+                        value=str(
+                            evaluate_expr(
+                                p.default_initial_value, allow_strings_returned=True
+                            )
+                        ),
                     )
                     on_start.actions.append(sa)
 
@@ -121,8 +136,41 @@ def mdf_to_neuroml(graph, save_to=None, format=None, run_duration_sec=2):
                     td = lems.TimeDerivative(variable=p.id, value=p.time_derivative)
                     ct.dynamics.add(td)
 
-        if len(node.output_ports) > 1:
-            raise Exception("Currently only max 1 output port supported in NeuroML...")
+            if p.conditions:
+                sv_exists = False
+
+                ct.dynamics.add(
+                    lems.StateVariable(name=p.id, dimension="none", exposure=p.id)
+                )
+                ct.add(lems.Exposure(p.id, "none"))
+                if p.value:
+                    on_start = lems.OnStart()
+                    ct.dynamics.add(on_start)
+                    sa = lems.StateAssignment(
+                        variable=p.id, value=str(evaluate_expr(p.value))
+                    )
+                    on_start.actions.append(sa)
+
+                for c in p.conditions:
+                    test = c.test if hasattr(c, "test") else c["test"]
+                    value = c.value if hasattr(c, "value") else c["value"]
+                    test = (
+                        test.replace(">=", ".geq.")
+                        .replace(">", ".gt.")
+                        .replace("<", ".lt.")
+                        .replace(">=", ".leq.")
+                        .replace("=", ".eq.")
+                        .replace(" and ", " .and. ")
+                    )
+                    print(f"IF ({test}) THEN {p.id} = {value}")
+
+                    oc = lems.OnCondition(test=test)
+                    sa = lems.StateAssignment(variable=p.id, value=str(value))
+                    oc.actions.append(sa)
+                    ct.dynamics.add(oc)
+
+        # if len(node.output_ports) > 1:
+        #    raise Exception("Currently only max 1 output port supported in NeuroML...")
 
         for op in node.output_ports:
             ct.add(lems.Exposure(op.id, "none"))
@@ -131,14 +179,14 @@ def mdf_to_neuroml(graph, save_to=None, format=None, run_duration_sec=2):
                     name=op.id, dimension="none", value=op.value, exposure=op.id
                 )
             )
-            only_output_port = "only_output_port"
-            ct.add(lems.Exposure(only_output_port, "none"))
+            output_port = "op_%s" % op.id
+            ct.add(lems.Exposure(output_port, "none"))
             ct.dynamics.add(
                 lems.DerivedVariable(
-                    name=only_output_port,
+                    name=output_port,
                     dimension="none",
                     value=op.id,
-                    exposure=only_output_port,
+                    exposure=output_port,
                 )
             )
 
@@ -189,35 +237,35 @@ def mdf_to_neuroml(graph, save_to=None, format=None, run_duration_sec=2):
     ###   Build Simulation object & save as JSON
 
     simtime = 1000 * run_duration_sec
-    dt = 0.1
+    dt = 1000 * run_dt_sec
     sim = neuromllite.Simulation(
         id="Sim%s" % net.id,
         network=new_file,
         duration=simtime,
         dt=dt,
         seed=123,
-        recordVariables={"OUTPUT": {"all": "*"}},
+        record_variables={"OUTPUT": {"all": "*"}},
     )
 
-    recordVariables = {}
+    record_variables = {}
     for node in graph.nodes:
         for ip in node.input_ports:
-            if not ip.id in recordVariables:
-                recordVariables[ip.id] = {}
-            recordVariables[ip.id][node.id] = 0
+            if not ip.id in record_variables:
+                record_variables[ip.id] = {}
+            record_variables[ip.id][node.id] = 0
 
         for p in node.parameters:
             if p.is_stateful():
-                if not p.id in recordVariables:
-                    recordVariables[p.id] = {}
-                recordVariables[p.id][node.id] = 0
+                if not p.id in record_variables:
+                    record_variables[p.id] = {}
+                record_variables[p.id][node.id] = 0
 
         for op in node.output_ports:
-            if not op.id in recordVariables:
-                recordVariables[op.id] = {}
-            recordVariables[op.id][node.id] = 0
+            if not op.id in record_variables:
+                record_variables[op.id] = {}
+            record_variables[op.id][node.id] = 0
 
-    sim.recordVariables = recordVariables
+    sim.record_variables = record_variables
     if save_to:
         sf = sim.to_json_file()
 

@@ -4,8 +4,9 @@ import numpy as np
 import sys
 import h5py
 import time
+import os
 
-
+# Note: the weights for this model were precomputed and saved in the file weights.h5
 def get_weight_info():
 
     weights = {}
@@ -162,10 +163,16 @@ def main():
 
     mod_graph = mod.graphs[0]
 
-    new_file = mod.to_yaml_file("%s.yaml" % mod.id)
-    new_file = mod.to_json_file("%s.json" % mod.id)
+    yaml_file = mod.to_yaml_file("%s.yaml" % mod.id)
+    json_file = mod.to_json_file("%s.json" % mod.id)
 
-    # mdf_to_graphviz(mod_graph,view_on_render=not test_all, level=3)
+    if "-mdf_to_pytorch" in sys.argv:
+        print("Exporting model to pure PyTorch")
+        from modeci_mdf.interfaces.pytorch import mdf_to_pytorch
+
+        pytorch_model = mdf_to_pytorch(
+            mod, yaml_file, eval_models=False, version="mdf.s"
+        )
 
     from modelspec.utils import FORMAT_NUMPY, FORMAT_TENSORFLOW
 
@@ -176,6 +183,8 @@ def main():
     eg = EvaluableGraph(mod_graph, verbose=False)
     eg.evaluate(array_format=format)
 
+    from modelspec.utils import _val_info
+
     print("Finished evaluating graph using array format %s" % format)
 
     for n in [
@@ -184,8 +193,8 @@ def main():
         "mlp_hidden_layer_with_relu",
         "mlp_output_layer",
     ]:
-        out = eg.enodes[n].evaluable_outputs["out_port"].curr_value
-        print(f"Final output value of node {n}: {out}, shape: {out.shape}")
+        out = _val_info(eg.enodes[n].evaluable_outputs["out_port"].curr_value)
+        print(f"Final output value of node {n}:\t {out}")
 
     if "-graph" in sys.argv:
         mod.to_graph_image(
@@ -194,7 +203,9 @@ def main():
             view_on_render=False,
             level=2,
             filename_root="mlp_pure_mdf",
-            only_warn_on_fail=True,  # Makes sure test of this doesn't fail on Windows on GitHub Actions
+            only_warn_on_fail=(
+                os.name == "nt"
+            ),  # Makes sure test of this doesn't fail on Windows on GitHub Actions
         )
 
     if test_all:
@@ -208,6 +219,9 @@ def main():
         imgs_to_test = imgs[:300]
 
         start = time.time()
+        all_guess = None
+        labelled_guess = {}
+
         for i in range(len(imgs_to_test)):
             ii = imgs[i, :, :]
             target = labels[i]
@@ -227,12 +241,30 @@ def main():
                     "Output of evaluated graph: %s %s (%s)"
                     % (out, out.shape, type(out).__name__)
                 )
+
+                """print(
+                    "Guesses:  %s, %s"
+                    % (all_guess, all_guess.shape if all_guess is not None else "-")
+                )"""
+                if all_guess is None:
+                    all_guess = out
+                else:
+                    all_guess = np.concatenate((all_guess, out))
+
+                if target not in labelled_guess:
+                    labelled_guess[target] = out
+                else:
+                    labelled_guess[target] = np.concatenate(
+                        (labelled_guess[target], out)
+                    )
+
                 prediction = np.argmax(out)
 
             match = target == int(prediction)
             if match:
                 matches += 1
             print(f"Target: {target}, prediction: {prediction}, match: {match}")
+
         t = time.time() - start
         print(
             "Matches: %i/%i, accuracy: %s%%. Total time: %.4f sec (%.4fs per run)"
@@ -244,6 +276,39 @@ def main():
                 t / len(imgs_to_test),
             )
         )
+
+        print(f"Guesses:  {all_guess}, {all_guess.shape}")
+
+        import matplotlib.pyplot as plt
+
+        fig, ax = plt.subplots()
+        title = "Guesses"
+        # plt.title(title)
+        # fig.canvas.set_window_title(title)
+        import matplotlib
+
+        cm = matplotlib.cm.get_cmap("Blues")
+
+        sorted_guesses = labelled_guess[0]
+        for i in range(9):
+            sorted_guesses = np.concatenate((sorted_guesses, labelled_guess[i + 1]))
+
+        im = plt.imshow(sorted_guesses, cmap=cm, aspect="auto")
+
+        cbar = plt.colorbar(im)
+
+        ax = plt.gca()
+
+        ax.set_xticks([i for i in range(10)])
+
+        ax.set_xlabel("Est. likelihood of each digit")
+
+        ax.set_ylabel("%i images ordered by label" % (len(imgs_to_test)))
+
+        plt.savefig("mlp_pure_mdf.results.png", bbox_inches="tight")
+
+        if "-nogui" not in sys.argv:
+            plt.show()
 
 
 if __name__ == "__main__":

@@ -1,7 +1,7 @@
 {
     "ABCD": {
-        "format": "ModECI MDF v0.3",
-        "generating_application": "Python modeci-mdf v0.3.3",
+        "format": "ModECI MDF v0.4",
+        "generating_application": "Python modeci-mdf v0.4.10",
         "graphs": {
             "abcd_example": {
                 "nodes": {
@@ -44,7 +44,7 @@
                             }
                         },
                         "output_ports": {
-                            "output_1": {
+                            "out_port": {
                                 "value": "linear_func"
                             }
                         }
@@ -77,7 +77,7 @@
                             }
                         },
                         "output_ports": {
-                            "output_1": {
+                            "out_port": {
                                 "value": "logistic_func"
                             }
                         }
@@ -88,7 +88,9 @@
                         },
                         "input_ports": {
                             "input_port1": {
-                                "shape": "(1,)"
+                                "shape": [
+                                    1
+                                ]
                             }
                         },
                         "parameters": {
@@ -116,7 +118,7 @@
                             }
                         },
                         "output_ports": {
-                            "output_1": {
+                            "out_port": {
                                 "value": "exponential_func"
                             }
                         }
@@ -127,7 +129,9 @@
                         },
                         "input_ports": {
                             "input_port1": {
-                                "shape": "(1,)"
+                                "shape": [
+                                    1
+                                ]
                             }
                         },
                         "parameters": {
@@ -143,7 +147,7 @@
                             }
                         },
                         "output_ports": {
-                            "output_1": {
+                            "out_port": {
                                 "value": "sin_func"
                             }
                         }
@@ -159,19 +163,19 @@
                     "edge_A_B": {
                         "sender": "A",
                         "receiver": "B",
-                        "sender_port": "output_1",
+                        "sender_port": "out_port",
                         "receiver_port": "input_port1"
                     },
                     "edge_B_C": {
                         "sender": "B",
                         "receiver": "C",
-                        "sender_port": "output_1",
+                        "sender_port": "out_port",
                         "receiver_port": "input_port1"
                     },
                     "edge_C_D": {
                         "sender": "C",
                         "receiver": "D",
-                        "sender_port": "output_1",
+                        "sender_port": "out_port",
                         "receiver_port": "input_port1"
                     }
                 }

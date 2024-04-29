@@ -98,3 +98,16 @@ def test_concat():
     input = (np.ones(3), np.ones(3), np.ones(3))
     out = onnx_ops.concat(*input, axis=0)
     assert np.allclose(out, np.concatenate(input, axis=0))
+
+
+def test_maxpool():
+    """Test ONNX Concat function. This is a variable number of inputs operator."""
+    out = onnx_ops.maxpool(
+        np.ones((1, 3, 32, 32)).astype(np.float32), kernel_shape=[2, 2]
+    )
+    assert True
+
+
+def test_randomuniform():
+    """Test ONNX randomuniform function."""
+    out = onnx_ops.randomuniform(low=-1.0, high=1.0, seed=0.0, shape=(1, 1))

@@ -2,6 +2,7 @@
     Useful utility functions for dealing with MDF objects.
 """
 
+
 from modeci_mdf.mdf import Model, Graph, Node, Edge, OutputPort, Function, InputPort
 
 
@@ -82,60 +83,34 @@ def load_mdf(filename: str) -> Model:
     """
     Load an MDF file from JSON or YAML. File type is detected automatically based on extension.
     """
-
-    if filename.endswith("yaml") or filename.endswith("yml"):
-        return load_mdf_yaml(filename)
-    else:
-        return load_mdf_json(filename)
+    return Model.from_file(filename)
 
 
 def load_mdf_json(filename: str) -> Model:
     """
     Load an MDF JSON file
     """
-
-    from modelspec.utils import load_json, _parse_element
-
-    data = load_json(filename)
-
-    print(f"Loaded a graph from {filename}, Root(s): {data.keys()}")
-    if data.keys() == "graphs":
-        data = {"UNSPECIFIED": data}
-    model = Model()
-    model = _parse_element(data, model)
-
-    return model
+    return Model.from_json_file(filename)
 
 
 def load_mdf_yaml(filename: str) -> Model:
     """
     Load an MDF YAML file
     """
-
-    from modelspec.utils import load_yaml, _parse_element
-
-    data = load_yaml(filename)
-
-    print(f"Loaded a graph from {filename}, Root(s): {data.keys()}")
-    if data.keys() == "graphs":
-        data = {"UNSPECIFIED": data}
-    model = Model()
-    model = _parse_element(data, model)
-
-    return model
+    return Model.from_yaml_file(filename)
 
 
 def color_rgb_to_hex(rgb):
     """Convert a rgb color to hexadecimal format."""
     color = "#"
-    print("Converting %s to hex color" % rgb)
+    # print("Converting %s to hex color" % rgb)
     for a in rgb.split():
         color = color + "%02x" % int(float(a) * 255)
     return color
 
 
 def is_number(s):
-    """Return :code:`True` if cast to :code:`float` does not throw ValueError, :code:`False` otherwise. """
+    """Return :code:`True` if cast to :code:`float` does not throw ValueError, :code:`False` otherwise."""
     try:
         float(s)
         return True

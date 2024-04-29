@@ -1,10 +1,11 @@
 from modeci_mdf.utils import load_mdf, print_summary
-from modeci_mdf.mdf import Node, Edge, OutputPort
+from modeci_mdf.mdf import Node, Edge, OutputPort, Parameter
 
 from modeci_mdf.execution_engine import EvaluableGraph
 
 from modelspec.utils import FORMAT_NUMPY, FORMAT_TENSORFLOW
 import sys
+import os
 import numpy as np
 
 verbose = True
@@ -27,11 +28,16 @@ def execute(multi=False):
         input = np.array([0])
 
     else:
-        size = 15
+
+        dt = 0.00025
+        size = 5
         max_amp = 0.5
-        input = np.array([max_amp * (-1 + 2 * i / size) for i in range(size + 1)])
+        input = np.array([max_amp * (-1 + 2 * i / (size - 1)) for i in range(size)])
         # input = [-0.4,-0.2, 0.,0.2,0.4]
-        input_node = Node(id="input_node", parameters={"input_level": input})
+        print("Inputs to be applied: %s" % input)
+        input_node = Node(id="input_node")
+
+        input_node.parameters.append(Parameter(id="input_level", value=input))
 
         op1 = OutputPort(id="out_port", value="input_level")
         input_node.output_ports.append(op1)
@@ -47,7 +53,7 @@ def execute(multi=False):
             id="input_edge",
             sender=input_node.id,
             sender_port=op1.id,
-            receiver="FNpop_0",
+            receiver="FNpop",
             receiver_port="INPUT",
         )
 
@@ -59,7 +65,9 @@ def execute(multi=False):
             view_on_render=False,
             level=3,
             filename_root="FNmulti",
-            only_warn_on_fail=True,  # Makes sure test of this doesn't fail on Windows on GitHub Actions
+            only_warn_on_fail=(
+                os.name == "nt"
+            ),  # Makes sure test of this doesn't fail on Windows on GitHub Actions
         )
 
         duration = 0.1
@@ -82,12 +90,13 @@ def execute(multi=False):
         else:
             eg.evaluate(array_format=format, time_increment=dt)
 
-        for i in range(len(eg.enodes["FNpop_0"].evaluable_parameters["V"].curr_value)):
+        for i in range(len(eg.enodes["FNpop"].evaluable_parameters["V"].curr_value)):
             if not i in vv:
                 vv[i] = []
                 ww[i] = []
-            v = eg.enodes["FNpop_0"].evaluable_parameters["V"].curr_value[i]
-            w = eg.enodes["FNpop_0"].evaluable_parameters["W"].curr_value[i]
+            v = eg.enodes["FNpop"].evaluable_parameters["V"].curr_value[i]
+            w = eg.enodes["FNpop"].evaluable_parameters["W"].curr_value[i]
+            print("   Time %s: index: %i, V: %s, W: %s" % (t, i, v, w))
             vv[i].append(v)
             ww[i].append(w)
             if i == 0:
@@ -97,12 +106,16 @@ def execute(multi=False):
     import matplotlib.pyplot as plt
 
     for vi in vv:
+        print(f"Plotting {vi}, {input}")
         plt.plot(times, vv[vi], label="V %.3f" % input[vi])
         plt.plot(times, ww[vi], label="W %.3f" % input[vi])
+
     plt.legend()
 
     if not multi:
         plt.savefig("MDFFNrun.png", bbox_inches="tight")
+    else:
+        plt.savefig("MDFFNrun.multi.png", bbox_inches="tight")
 
     if not "-nogui" in sys.argv:
         plt.show()
